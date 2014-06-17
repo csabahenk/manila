@@ -203,7 +203,7 @@ class GaneshaShareDriverTestCase(test.TestCase):
         fake_utils.fake_execute_set_repliers([])
         fake_utils.fake_execute_clear_log()
 
-    def test__read_ganesha_template(self):
+    def test__read_ganesha_templates(self):
         """Test if ganesha config input is found properly"""
 
         __builtin__.open = Mock()
@@ -218,7 +218,7 @@ class GaneshaShareDriverTestCase(test.TestCase):
            export templates and export data"""
 
         # overwrite export id calculation routine with static value
-        self._driver_get_export_id = Mock(return_value=77)
+        self._driver._get_export_id = Mock(return_value=77)
         ret = self._driver.make_ganesha_conf(
                   ganeshaconf_base_template,
                   ganeshaconf_gluster_export_template,
@@ -305,7 +305,7 @@ class GaneshaShareDriverTestCase(test.TestCase):
         for h, _, c in helper_call_table:
             self.assertEqual(getattr(self._driver, h).call_count, c)
 
-    def test__update_ganesha_exportcbange(self):
+    def test__update_ganesha_exportchange(self):
         """Test Ganesha check/restart routine when config (exports) changed"""
 
         helper_call_table =\
