@@ -21,6 +21,7 @@ from mock import patch
 import os
 import string
 import subprocess
+from copy import copy
 
 from manila import context
 from manila.db.sqlalchemy import models
@@ -226,7 +227,104 @@ class GaneshaShareDriverTestCase(test.TestCase):
         # normalize output by stripping spaces
         ret = ret.replace(' ', '')
 
-        # manual calculation of expected output
+        # manual calculation of expected output;
+        # it would look as follows (modulo whitespace):
+        #
+        # FSAL
+        # {
+        #   GLUSTER {
+        #     FSAL_Shared_Library = "/usr/local/lib64/ganesha/libfsalgluster.so";
+        #     LogFile = "/var/log/nfs-ganesha.log";
+        #   }
+        # }
+        # FileSystem
+        # {
+        #   Umask = 0000;
+        #   Link_support = TRUE;
+        #   Symlink_support = TRUE;
+        #   CanSetTime = TRUE;
+        #   xattr_access_rights = 0600;
+        # }
+        #
+        # NFS_Core_Param
+        # {
+        #     Nb_Worker = 8;
+        #     NFS_Port = 2049;
+        # }
+        # NFS_IP_Name
+        # {
+        #     Index_Size = 17;
+        #     Expiration_Time = 3600;
+        # }
+        # _9P
+        # {
+        #     DebugLevel = "NIV_FULL_DEBUG";
+        #     LogFile    = "/tmp/nfs-ganesha.log";
+        # }
+        #
+        #
+        # EXPORT
+        # {
+        #   Export_Id = 1;
+        #   Path = "/testvol";
+        #   FS_Specific =     "volume=testvol,hostname=127.0.0.1,";
+        #   FSAL = "GLUSTER";
+        #   Root_Access = "*";
+        #   RW_Access = "127.0.0.1";
+        #   Pseudo = "/testvol";
+        #   Anonymous_root_uid = -2;
+        #   NFS_Protocols = "3,4";
+        #   Transport_Protocols = "TCP";
+        #   SecType = "sys";
+        #   MaxRead = 131072;
+        #   MaxWrite = 131072;
+        #   PrefRead = 32768;
+        #   PrefWrite = 32768;
+        #   Filesystem_id = 192.168;
+        #   Tag = "gfs";
+        # }
+        #
+        # EXPORT
+        # {
+        #   Export_Id = 77;
+        #   Path = "/testvol/d1";
+        #   FS_Specific =     "volume=testvol,hostname=127.0.0.1,volpath=/d1";
+        #   FSAL = "GLUSTER";
+        #   Root_Access = "*";
+        #   RW_Access = "10.0.0.1";
+        #   Pseudo = "/testvol/d1";
+        #   Anonymous_root_uid = -2;
+        #   NFS_Protocols = "3,4";
+        #   Transport_Protocols = "TCP";
+        #   SecType = "sys";
+        #   MaxRead = 131072;
+        #   MaxWrite = 131072;
+        #   PrefRead = 32768;
+        #   PrefWrite = 32768;
+        #   Filesystem_id = 192.168;
+        #   Tag = "gfs";
+        # }
+        #
+        # EXPORT
+        # {
+        #   Export_Id = 77;
+        #   Path = "/testvol/d2";
+        #   FS_Specific =     "volume=testvol,hostname=127.0.0.1,volpath=/d2";
+        #   FSAL = "GLUSTER";
+        #   Root_Access = "*";
+        #   RW_Access = "10.0.0.2";
+        #   Pseudo = "/testvol/d2";
+        #   Anonymous_root_uid = -2;
+        #   NFS_Protocols = "3,4";
+        #   Transport_Protocols = "TCP";
+        #   SecType = "sys";
+        #   MaxRead = 131072;
+        #   MaxWrite = 131072;
+        #   PrefRead = 32768;
+        #   PrefWrite = 32768;
+        #   Filesystem_id = 192.168;
+        #   Tag = "gfs";
+        # }
         exdict_base = {'gluster_volume': 'testvol',
                        'gluster_hostname': '127.0.0.1'}
         svc_exp_dict, exp1_dict, exp2_dict =\
@@ -234,12 +332,12 @@ class GaneshaShareDriverTestCase(test.TestCase):
         svc_exp_dict.update(export_id=1, export_path='/testvol',
                             gluster_volpath='', export_access='127.0.0.1',
                             export_pseudo='/testvol')
-        share_exp = ganesha_export['shares']
+        share_exp = ganesha_exports['shares']
         for ed, d in zip([exp1_dict, exp2_dict], share_exp):
-            ed.update(export_id=77, export_path='/testvol/' + d,
-                      gluster_volpath='volpath=/' + d,
-                      export_access=share_exp[d],
-                      export_pseudo='/testvol/' + d)
+            ed.update(export_id=77, export_path='/testvol/' + d[0],
+                      gluster_volpath='volpath=/' + d[0],
+                      export_access=d[1],
+                      export_pseudo='/testvol/' + d[0])
         extemp = string.Template(ganeshaconf_gluster_export_template)
         confparts = [ganeshaconf_base_template] +\
                     [extemp.substitute(d) for d in
