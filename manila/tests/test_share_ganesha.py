@@ -57,39 +57,52 @@ from oslo.config import cfg
 # note that for tests of `_helper_method` I used the name format
 # `test__helper_method_whatsoever` instead of the more common
 # `test_helper_method_whatsoever`, to make it easier on the eye); the
-# interesting thing is that helper methods are of two kind:
+# interesting thing is how we structure the helper methods.
 #
-# - quasi-pure
+# For our purposes, interactions with the external environment are
+# considered to be either trivial or implementation detail. It's up
+# to the prospective implementer whether she uses a database or a flat
+# file to provide permanence for a piece of data; we are not interested in it.
+# For example, see one of the helpers, _get_export_id(). It's expected to provide
+# a numerical id for the export associated with a share, and that numerical
+# id should be invariant for given share parameters (invariant even through
+# service restart). One way of implementing it could be to store the association
+# in a db; but it can also be feasible to serialize the share parameters and take
+# a hash of the serialized blob as the export id -- we are not interested to
+# hereby to express a preference.
+#
+# What we are interested in is the state logic: for which action, upon which
+# conditions what state change occurs? Ideally such logic is described by
+# pure functions: ones that don't do side effects, just perform a deterministic
+# computation of states: f(Action, State1) -> State2. However, our semantics
+# is not suitable for such a description, as we can't explicitly make states
+# into objects. So we'll use the thing that comes closest to purity: functions
+# which don't do impure things directly, rather they outsource them to other
+# functions within the module. It's like the Godfather and the mob -- the
+# Godfather behaves always like a gentleman, the rough stuff is left for
+# the others. We will call such functions _quasi-pure_ (nb., unlike "pure",
+# which is a well established concept, it is our own coinage for the purposes
+# of this document).
+#
+# So in order to match this pronounced bias of us, we'll specify helper methods
+# of these two kinds:
+#
 # - ones that deal with external resources ("resource functions" in the sequel)
-#
-# What resource functions do I think is easy to understand -- typical ones
-# interact with db, or filesystem. Two remarks on them:
-# - the resource functions are intended to be as close to the (technically not
-#   specified) ideal of atomiticy as possible. They just do one particular
-#   action, like read or write a file, without any event logic.
-# - (at least in this initial effort) they are mostly black boxes. We don't
-#   specify what external resource to use (db or filesystem), we treat thay as
-#   implemention detail, we just specify what side effect they ought to have
-#   (typically, get/put/delete some piece of data).
-#
-# Quasi-pure ones are on the orthogonal axis of resource functions: they have
-# logic but as small side effect on their own as it's possible -- that is, they
-# either encapsulate side effects in calls to resource functions, or do side
-# effects that are known of and handled at test framework level -- like command
-# execution, for which the test framework provides generic mocks.
+# - quasi-pure
 #
 # The two type of helper functions are not separated by syntactic convention
 # (both just follow the underscore-name pattern). What tells them apart is
-# coverage. By and large resource functions are the ones for which we don't
+# coverage. Primarily, resource functions are the ones for which we don't
 # provide test cases (as they are black boxes), we just cite them in as mocks
 # within the test cases of the other functions (driver interface or quasi-pure
-# helper) which are calling them.  What coverage aims to expose is the event
-# logic of driver interface and quasi-pure helper functions.
+# helper) which are calling them.
 #
-# A notable exception is _read_ganesha_templates() which is a resource function
-# (for reading in the templates used for ganesha config generation) but is not
-# treated as black box rather we specify what files to read in. This
-# eccentricity is marked by mocking a system call (open(2)).
+# That said, there are some resource functions which are not completely
+# black boxes, and we intend to specify some aspects of them. They do have
+# test cases; we can recognize them by using mocks of functions out of the
+# module. At the moment the only such one is _read_ganesha_templates(),
+# where we want to specify what template files to read in; this is reflected
+# in having a mock of the open(2) system call.
 
 CONF = cfg.CONF
 
