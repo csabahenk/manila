@@ -363,7 +363,7 @@ class GaneshaShareDriverTestCase(test.TestCase):
             **ganesha_exports)                    # taken from _get_exports()
         self._driver._read_ganesha_conffile.assert_once_called_with()
         self.assertEqual(self._driver._write_ganesha_conffile.call_count, 1)
-        self.assertEqual(ret, False)
+        self.assertEqual(ret, True)
 
     def test__update_ganesha_conf_nochange(self):
         """Test _update_ganesha_conf when configuration remained the same"""
@@ -382,7 +382,7 @@ class GaneshaShareDriverTestCase(test.TestCase):
             **ganesha_exports)                    # taken from _get_exports()
         self._driver._read_ganesha_conffile.assert_once_called_with()
         self.assertEqual(self._driver._write_ganesha_conffile.call_count, 0)
-        self.assertEqual(ret, True)
+        self.assertEqual(ret, False)
 
     def test__update_ganesha_nochange(self):
         """Test Ganesha check/restart routine when nothing changed"""
@@ -391,7 +391,7 @@ class GaneshaShareDriverTestCase(test.TestCase):
         # we keep it like that for visibility
         helper_call_table =\
         (('_make_ganesha_conf',     {},                    1),
-         ('_update_ganesha_conf',   {'return_value':True}, 1),
+         ('_update_ganesha_conf',   {'return_value':False}, 1),
          ('_check_ganesha_running', {'return_value':True}, 1),
          ('_restart_ganesha',       {},                    0),
          ('_ensure_service_mount',  {},                    1))
@@ -408,7 +408,7 @@ class GaneshaShareDriverTestCase(test.TestCase):
 
         helper_call_table =\
         (('_make_ganesha_conf',     {},                     1),
-         ('_update_ganesha_conf',   {'return_value':False}, 1),
+         ('_update_ganesha_conf',   {'return_value':True}, 1),
          ('_check_ganesha_running', {},                     0),
          ('_restart_ganesha',       {},                     1),
          ('_ensure_service_mount',  {},                     1))
@@ -425,7 +425,7 @@ class GaneshaShareDriverTestCase(test.TestCase):
 
         helper_call_table =\
         (('_make_ganesha_conf',     {},                     1),
-         ('_update_ganesha_conf',   {'return_value':True},  1),
+         ('_update_ganesha_conf',   {'return_value':False},  1),
          ('_check_ganesha_running', {'return_value':False}, 1),
          ('_restart_ganesha',       {},                     1),
          ('_ensure_service_mount',  {},                     1))
