@@ -17,3 +17,11 @@ ip: CommandFilter, /sbin/ip, root
 
 # manila/network/linux/interface.py: 'ovs-vsctl', 'add-port', '%s', '%s'
 ovs-vsctl: CommandFilter, /usr/bin/ovs-vsctl, root
+
+# manila/share/drivers/ganesha/ganesharness.py: 'mkdir', '-p', '%s', '-t', '%s'
+mktemp: CommandFilter, /bin/mktemp, root
+# manila/share/drivers/ganesha/ganesharness.py:
+shcat: RegExpFilter, /bin/sh, root, sh, -c, cat > /etc/ganesha/export.d/.*
+# manila/share/drivers/ganesha/ganesharness.py:
+dbus-add: RegExpFilter, /usr/bin/dbus-send, root, dbus-send, --print-reply, --system, --dest=org.ganesha.nfsd, /org/ganesha/nfsd/ExportMgr, org.ganesha.nfsd.exportmgr.AddExport, .*, .*
+dbus-remove: RegExpFilter, /usr/bin/dbus-send, root, dbus-send, --print-reply, --system, --dest=org.ganesha.nfsd, /org/ganesha/nfsd/ExportMgr, org.ganesha.nfsd.exportmgr.RemoveExport, .*
