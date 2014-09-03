@@ -27,13 +27,16 @@ TODO(rraja): support SMB protocol.
 
 import errno
 import os
-import pipes
 import re
+import sys
 import xml.etree.cElementTree as etree
 
 from manila import exception
 from manila.openstack.common import log as logging
 from manila.share import driver
+from manila.share.drivers.ganesha import GaneshaNASHelper
+from manila.share.drivers.ganesha import NASHelperBase
+from manila.share.drivers.ganesha import utils as ganeshautils
 
 from oslo.config import cfg
 
@@ -47,6 +50,10 @@ GlusterfsManilaShare_opts = [
     cfg.StrOpt('glusterfs_mount_point_base',
                default='$state_path/mnt',
                help='Base directory containing mount points for Gluster '
+                    'volumes.'),
+    cfg.StrOpt('glusterfs_nfs_server_type',
+               default='Gluster',
+               help='Type of NFS server that mediate access to the Gluster '
                     'volumes.'),
 ]
 
@@ -74,15 +81,14 @@ class GlusterAddress(object):
         self.qualified = address
         self.export = ':/'.join([self.host, self.volume])
 
-    def make_gluster_args(self, *args):
-        args = ('gluster',) + args
-        kw = {}
+    def make_gluster_call(self, execf):
         if self.remote_user:
-            args = ('ssh', '@'.join([self.remote_user, self.host]),
-                    ' '.join(pipes.quote(a) for a in args))
+            wexecf = ganeshautils.SSHExecutor(self.host, 22, None,
+                                               self.remote_user)
         else:
-            kw['run_as_root'] = True
-        return args, kw
+            wexecf = ganeshautils.RootExecutor(execf)
+        return lambda *args, **kwargs: wexecf(*(('gluster',) + args),
+                                              **kwargs)
 
 
 class GlusterfsShareDriver(driver.ExecuteMixin, driver.ShareDriver):
@@ -91,7 +97,7 @@ class GlusterfsShareDriver(driver.ExecuteMixin, driver.ShareDriver):
     def __init__(self, db, *args, **kwargs):
         super(GlusterfsShareDriver, self).__init__(*args, **kwargs)
         self.db = db
-        self._helpers = None
+        self._helpers = {}
         self.gluster_address = None
         self.configuration.append_config_values(GlusterfsManilaShare_opts)
         self.backend_name = self.configuration.safe_get(
@@ -116,16 +122,16 @@ class GlusterfsShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         self._setup_gluster_vol()
 
     def _setup_gluster_vol(self):
-        # exporting the whole volume must be prohibited
-        # to not to defeat access control
-        args, kw = self.gluster_address.make_gluster_args(
-            'volume', 'set', self.gluster_address.volume,
-            NFS_EXPORT_VOL, 'off')
-        try:
-            self._execute(*args, **kw)
-        except exception.ProcessExecutionError as exc:
-            LOG.error(_("Error in gluster volume set: %s"), exc.stderr)
-            raise
+        """Initializes protocol-specific NAS drivers."""
+        # The below seems crude. Accomodate CIFS helper as well?
+        nfs_helper = getattr(sys.modules[__name__],
+                             self.configuration.glusterfs_nfs_server_type +\
+                             'NFSHelper')
+        self._helpers['NFS']=nfs_helper(self._execute,
+                                        self.configuration,
+                                        gluster_address=self.gluster_address)
+        for helper in self._helpers.values():
+            helper.init_helper()
 
     def check_for_setup_error(self):
         pass
@@ -169,50 +175,6 @@ class GlusterfsShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
         with open(config_file) as f:
             return f.readline().strip()
-
-    def _get_export_dir_dict(self):
-        """Get the export entries of shares in the GlusterFS volume."""
-        try:
-            args, kw = self.gluster_address.make_gluster_args(
-                '--xml',
-                'volume',
-                'info',
-                self.gluster_address.volume
-            )
-            out, err = self._execute(*args, **kw)
-        except exception.ProcessExecutionError as exc:
-            LOG.error(_("Error retrieving volume info: %s"), exc.stderr)
-            raise
-
-        if not out:
-            raise exception.GlusterfsException(
-                'Empty answer from gluster command'
-            )
-
-        vix = etree.fromstring(out)
-        if int(vix.find('./volInfo/volumes/count').text) != 1:
-            raise exception.InvalidShare('Volume name ambiguity')
-        export_dir = None
-        for o, v in \
-            ((e.find(a).text for a in ('name', 'value'))
-             for e in vix.findall(".//option")):
-            if o == NFS_EXPORT_DIR:
-                export_dir = v
-                break
-        edh = {}
-        if export_dir:
-            # see
-            # https://github.com/gluster/glusterfs
-            #  /blob/aa19909/xlators/nfs/server/src/nfs.c#L1582
-            # regarding the format of nfs.export-dir
-            edl = export_dir.split(',')
-            # parsing export_dir into a dict of {dir: [hostpec,..]..}
-            # format
-            r = re.compile('\A/(.*)\((.*)\)\Z')
-            for ed in edl:
-                d, e = r.match(ed).groups()
-                edh[d] = e.split('|')
-        return edh
 
     def _ensure_gluster_vol_mounted(self):
         """Ensure GlusterFS volume is native-mounted on Manila host."""
@@ -312,7 +274,86 @@ class GlusterfsShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         """Might not be needed?"""
         pass
 
-    def _manage_access(self, context, share, access, cbk):
+    def _get_helper(self, share):
+        if share['share_proto'].startswith('NFS'):
+            return self._helpers['NFS']
+        elif share['share_proto'].startswith('CIFS'):
+            raise NotImplementedError() # Late notification. Notify error while creating a CIFS share itself.
+        else:
+            raise exception.InvalidShare(reason='Wrong share type')
+
+    def allow_access(self, context, share, access, share_server=None):
+        """Allow access to the share."""
+        self._get_helper(share).allow_access('/', share, access)
+
+    def deny_access(self, context, share, access, share_server=None):
+        """Deny access to the share."""
+        self._get_helper(share).deny_access('/', share, access)
+
+
+class GlusterNFSHelper(NASHelperBase):
+
+    def __init__(self, execute, config_object, **kwargs):
+        self.gluster_address = kwargs.pop('gluster_address')
+        super(GlusterNFSHelper, self).__init__(execute, config_object,
+                                               **kwargs)
+        self.gluster_call = self.gluster_address.make_gluster_call(
+                              self._execute)
+
+    def init_helper(self):
+        # exporting the whole volume must be prohibited
+        # to not to defeat access control
+        try:
+            self.gluster_call('volume', 'set', self.gluster_address.volume,
+              NFS_EXPORT_VOL, 'off')
+        except exception.ProcessExecutionError as exc:
+            LOG.error(_("Error in gluster volume set: %s") % exc.stderr)
+            raise
+
+    def _get_export_dir_dict(self):
+        """Get the export entries of shares in the GlusterFS volume."""
+        try:
+            out, err = self.gluster_call(
+                '--xml',
+                'volume',
+                'info',
+                self.gluster_address.volume
+            )
+        except exception.ProcessExecutionError as exc:
+            LOG.error(_("Error retrieving volume info: %s") % exc.stderr)
+            raise
+
+        if not out:
+            raise exception.GlusterfsException(
+                'Empty answer from gluster command'
+            )
+
+        vix = etree.fromstring(out)
+        if int(vix.find('./volInfo/volumes/count').text) != 1:
+            raise exception.InvalidShare('Volume name ambiguity')
+        export_dir = None
+        for o, v in \
+            ((e.find(a).text for a in ('name', 'value'))
+             for e in vix.findall(".//option")):
+            if o == NFS_EXPORT_DIR:
+                export_dir = v
+                break
+        edh = {}
+        if export_dir:
+            # see
+            # https://github.com/gluster/glusterfs
+            #  /blob/aa19909/xlators/nfs/server/src/nfs.c#L1582
+            # regarding the format of nfs.export-dir
+            edl = export_dir.split(',')
+            # parsing export_dir into a dict of {dir: [hostpec,..]..}
+            # format
+            r = re.compile('\A/(.*)\((.*)\)\Z')
+            for ed in edl:
+                d, e = r.match(ed).groups()
+                edh[d] = e.split('|')
+        return edh
+
+    def _manage_access(self, share_name, access_type, access_to, cbk):
         """Manage share access with cbk.
 
         Adjust the exports of the Gluster-NFS server using cbk.
@@ -332,29 +373,27 @@ class GlusterfsShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         :returns: bool (cbk leaves ddict intact) or None (cbk modifies ddict)
         """
 
-        if access['access_type'] != 'ip':
+        if access_type != 'ip':
             raise exception.InvalidShareAccess('only ip access type allowed')
         export_dir_dict = self._get_export_dir_dict()
-        if cbk(export_dir_dict, share['name'], access['access_to']):
+        if cbk(export_dir_dict, share_name, access_to):
             return
 
         if export_dir_dict:
             export_dir_new = (",".join("/%s(%s)" % (d, "|".join(v))
                               for d, v in sorted(export_dir_dict.items())))
-            args, kw = self.gluster_address.make_gluster_args(
-                'volume', 'set', self.gluster_address.volume,
-                NFS_EXPORT_DIR, export_dir_new)
+            args = ('volume', 'set', self.gluster_address.volume,
+                    NFS_EXPORT_DIR, export_dir_new)
         else:
-            args, kw = self.gluster_address.make_gluster_args(
-                'volume', 'reset', self.gluster_address.volume,
-                NFS_EXPORT_DIR)
+            args = ('volume', 'reset', self.gluster_address.volume,
+                    NFS_EXPORT_DIR)
         try:
-            self._execute(*args, **kw)
+            self.gluster_call(*args)
         except exception.ProcessExecutionError as exc:
             LOG.error(_("Error in gluster volume set: %s"), exc.stderr)
             raise
 
-    def allow_access(self, context, share, access, share_server=None):
+    def allow_access(self, base, share, access):
         """Allow access to a share."""
         def cbk(ddict, edir, host):
             if edir not in ddict:
@@ -362,9 +401,10 @@ class GlusterfsShareDriver(driver.ExecuteMixin, driver.ShareDriver):
             if host in ddict[edir]:
                 return True
             ddict[edir].append(host)
-        self._manage_access(context, share, access, cbk)
+        self._manage_access(share['name'], access['access_type'],
+                            access['access_to'], cbk)
 
-    def deny_access(self, context, share, access, share_server=None):
+    def deny_access(self, base, share, access):
         """Deny access to a share."""
         def cbk(ddict, edir, host):
             if edir not in ddict or host not in ddict[edir]:
@@ -372,4 +412,5 @@ class GlusterfsShareDriver(driver.ExecuteMixin, driver.ShareDriver):
             ddict[edir].remove(host)
             if not ddict[edir]:
                 ddict.pop(edir)
-        self._manage_access(context, share, access, cbk)
+        self._manage_access(share['name'], access['access_type'],
+                            access['access_to'], cbk)
