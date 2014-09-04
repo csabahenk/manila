@@ -449,10 +449,6 @@ class EMCVnxXMLAPIError(Invalid):
     message = _("%(err)s")
 
 
-class SSHInjectionThreat(ManilaException):
-    message = _("SSH command injection detected: %(command)s")
-
-
 class GPFSException(ManilaException):
     message = _("GPFS exception occurred.")
 

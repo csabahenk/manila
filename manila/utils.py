@@ -106,41 +106,6 @@ def trycmd(*args, **kwargs):
     return processutils.trycmd(*args, **kwargs)
 
 
-def check_ssh_injection(cmd_list):
-    ssh_injection_pattern = ['`', '$', '|', '||', ';', '&', '&&', '>', '>>',
-                             '<']
-
-    # Check whether injection attacks exist
-    for arg in cmd_list:
-        arg = arg.strip()
-
-        # Check for matching quotes on the ends
-        is_quoted = re.match('^(?P<quote>[\'"])(?P<quoted>.*)(?P=quote)$', arg)
-        if is_quoted:
-            # Check for unescaped quotes within the quoted argument
-            quoted = is_quoted.group('quoted')
-            if quoted:
-                if (re.match('[\'"]', quoted) or
-                        re.search('[^\\\\][\'"]', quoted)):
-                    raise exception.SSHInjectionThreat(command=cmd_list)
-        else:
-            # We only allow spaces within quoted arguments, and that
-            # is the only special character allowed within quotes
-            if len(arg.split()) > 1:
-                raise exception.SSHInjectionThreat(command=cmd_list)
-
-        # Second, check whether there is any dangerous character in the
-        # command. So, the shell special operator must be a single argument.
-        for c in ssh_injection_pattern:
-            if arg == c:
-                continue
-
-            result = arg.find(c)
-            if not result == -1:
-                if result == 0 or not arg[result - 1] == '\\':
-                    raise exception.SSHInjectionThreat(command=cmd_list)
-
-
 def create_channel(client, width, height):
     """Invoke an interactive shell session on server."""
     channel = client.invoke_shell()

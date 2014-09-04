@@ -33,22 +33,18 @@ Limitation:
 from copy import copy
 import math
 import os
-import random
 import re
 import socket
 
-from eventlet import greenthread
 from oslo.config import cfg
 from oslo.utils import units
 
 from manila import exception
-from manila.openstack.common import excutils
 from manila.openstack.common import importutils
 from manila.openstack.common import log as logging
-from manila.openstack.common import processutils
 from manila.share import driver
 from manila.share.drivers.ibm import ganesha_utils
-from manila import utils
+from manila.share.drivers.ganesha import utils as ganeshautils
 
 LOG = logging.getLogger(__name__)
 
@@ -148,80 +144,26 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         self.sshpool = None
         self.ssh_connections = {}
 
-    def _gpfs_execute(self, *cmd, **kwargs):
         host = self.configuration.gpfs_share_export_ip
         localserver_iplist = socket.gethostbyname_ex(socket.gethostname())[2]
-
         if host in localserver_iplist:  # run locally
-            return utils.execute(*cmd, **kwargs)
+            execf = ganeshautils.RootExecutor(self._execute)
         else:
-            check_exit_code = kwargs.pop('check_exit_code', None)
-            return self._run_ssh(host, cmd, check_exit_code)
-
-    def _run_ssh(self, host, cmd_list, check_exit_code=True, attempts=1):
-        try:
-            utils.check_ssh_injection(cmd_list)
-        except Exception as e:
-            command = ' '.join(cmd_list)
-            msg = (_('SSH injection threat detected in command %s.') %
-                   command)
-            LOG.error(msg)
-            raise exception.GPFSException(msg)
-
-        command = ' '.join(cmd_list)
-
-        if not self.sshpool:
-            gpfs_login = self.configuration.gpfs_login
-            password = self.configuration.gpfs_password
-            privatekey = self.configuration.gpfs_private_key
-            gpfs_ssh_port = self.configuration.gpfs_ssh_port
-            ssh_conn_timeout = self.configuration.ssh_conn_timeout
-            min_size = self.configuration.ssh_min_pool_conn
-            max_size = self.configuration.ssh_max_pool_conn
-
-            self.sshpool = utils.SSHPool(host,
-                                         gpfs_ssh_port,
-                                         ssh_conn_timeout,
-                                         gpfs_login,
-                                         password=password,
-                                         privatekey=privatekey,
-                                         min_size=min_size,
-                                         max_size=max_size)
-        last_exception = None
-        try:
-            total_attempts = attempts
-            with self.sshpool.item() as ssh:
-                while attempts > 0:
-                    attempts -= 1
-                    try:
-                        return processutils.ssh_execute(
-                            ssh,
-                            command,
-                            check_exit_code=check_exit_code)
-                    except Exception as e:
-                        LOG.error(e)
-                        last_exception = e
-                        greenthread.sleep(random.randint(20, 500) / 100.0)
-                try:
-                    raise exception.ProcessExecutionError(
-                        exit_code=last_exception.exit_code,
-                        stdout=last_exception.stdout,
-                        stderr=last_exception.stderr,
-                        cmd=last_exception.cmd)
-                except AttributeError:
-                    raise exception.ProcessExecutionError(
-                        exit_code=-1,
-                        stdout="",
-                        stderr="Error running SSH command",
-                        cmd=command)
-
-        except Exception:
-            with excutils.save_and_reraise_exception():
-                LOG.error(_('Error running SSH command: %s') % command)
+            execf = ganeshautils.SSHExecutor(
+              host,
+              self.configuration.gpfs_ssh_port,
+              self.configuration.ssh_conn_timeout,
+              self.configuration.gpfs_login,
+              password=self.configuration.gpfs_password,
+              privatekey=self.configuration.gpfs_private_key,
+              min_size=self.configuration.ssh_min_pool_conn,
+              max_size=self.configuration.ssh_max_pool_conn
+            )
+        self._gpfs_execute = execf
 
     def _check_gpfs_state(self):
         try:
-            out, _ = self._gpfs_execute('mmgetstate', '-Y', run_as_root=True)
+            out, _ = self._gpfs_execute('mmgetstate', '-Y')
         except exception.ProcessExecutionError:
             msg = (_('Failed to check GPFS state.'))
             LOG.error(msg)
@@ -235,7 +177,8 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
     def _is_dir(self, path):
         try:
-            output, _ = self._gpfs_execute('stat', '--format=%F', path)
+            output, _ = self._gpfs_execute('stat', '--format=%F',
+                                           path, run_as_root=False)
         except exception.ProcessExecutionError:
             msg = (_('%s is not a directory.') % path)
             LOG.error(msg)
@@ -245,7 +188,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
     def _is_gpfs_path(self, directory):
         try:
-            self._gpfs_execute('mmlsattr', directory, run_as_root=True)
+            self._gpfs_execute('mmlsattr', directory)
         except exception.ProcessExecutionError:
             msg = (_('%s is not on GPFS filesystem.') % directory)
             LOG.error(msg)
@@ -275,7 +218,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
     def _get_gpfs_device(self):
         fspath = self.configuration.gpfs_mount_point_base
         try:
-            (out, _) = self._gpfs_execute('df', fspath, run_as_root=True)
+            (out, _) = self._gpfs_execute('df', fspath)
         except exception.ProcessExecutionError:
             msg = (_('Failed to get GPFS device for %s.') % fspath)
             LOG.error(msg)
@@ -298,7 +241,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         # create fileset for the share, link it to root path and set max size
         try:
             self._gpfs_execute('mmcrfileset', fsdev, sharename,
-                               '--inode-space', 'new', run_as_root=True)
+                               '--inode-space', 'new')
         except exception.ProcessExecutionError:
             msg = (_('Failed to create fileset on %(fsdev)s for '
                      'the share %(sharename)s.') %
@@ -308,7 +251,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
         try:
             self._gpfs_execute('mmlinkfileset', fsdev, sharename, '-J',
-                               sharepath, run_as_root=True)
+                               sharepath)
         except exception.ProcessExecutionError:
             msg = (_('Failed to link fileset for the share %s.') % sharename)
             LOG.error(msg)
@@ -316,14 +259,14 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
         try:
             self._gpfs_execute('mmsetquota', '-j', sharename, '-h',
-                               sizestr, fsdev, run_as_root=True)
+                               sizestr, fsdev)
         except exception.ProcessExecutionError:
             msg = (_('Failed to set quota for the share %s.') % sharename)
             LOG.error(msg)
             raise exception.GPFSException(msg)
 
         try:
-            self._gpfs_execute('chmod', '777', sharepath, run_as_root=True)
+            self._gpfs_execute('chmod', '777', sharepath)
         except exception.ProcessExecutionError:
             msg = (_('Failed to set permissions for share %s.') % sharename)
             LOG.error(msg)
@@ -336,16 +279,14 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
         # unlink and delete the share's fileset
         try:
-            self._gpfs_execute('mmunlinkfileset', fsdev, sharename, '-f',
-                               run_as_root=True)
+            self._gpfs_execute('mmunlinkfileset', fsdev, sharename, '-f')
         except exception.ProcessExecutionError:
             msg = (_('Failed unlink fileset for share %s.') % sharename)
             LOG.error(msg)
             raise exception.GPFSException(msg)
 
         try:
-            self._gpfs_execute('mmdelfileset', fsdev, sharename, '-f',
-                               run_as_root=True)
+            self._gpfs_execute('mmdelfileset', fsdev, sharename, '-f')
         except exception.ProcessExecutionError:
             msg = (_('Failed delete fileset for share %s.') % sharename)
             LOG.error(msg)
@@ -354,8 +295,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
     def _get_available_capacity(self, path):
         """Calculate available space on path."""
         try:
-            out, _ = self._gpfs_execute('df', '-P', '-B', '1', path,
-                                        run_as_root=True)
+            out, _ = self._gpfs_execute('df', '-P', '-B', '1', path)
         except exception.ProcessExecutionError:
             msg = (_('Failed to check available capacity for %s.') % path)
             LOG.error(msg)
@@ -376,7 +316,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
         try:
             self._gpfs_execute('mmcrsnapshot', fsdev, snapshot['name'],
-                               '-j', sharename, run_as_root=True)
+                               '-j', sharename)
         except exception.ProcessExecutionError:
             msg = (_('Failed to create snapshot %s.') % snapshot['name'])
             LOG.error(msg)
@@ -389,7 +329,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
         try:
             self._gpfs_execute('mmdelsnapshot', fsdev, snapshot['name'],
-                               '-j', sharename, run_as_root=True)
+                               '-j', sharename)
         except exception.ProcessExecutionError:
             msg = (_('Failed to delete snapshot %s.') % snapshot['name'])
             LOG.error(msg)
@@ -401,8 +341,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         snapshot_path = self._get_snapshot_path(snapshot)
         snapshot_path = snapshot_path + "/"
         try:
-            self._gpfs_execute('rsync', '-rp', snapshot_path, share_path,
-                               run_as_root=True)
+            self._gpfs_execute('rsync', '-rp', snapshot_path, share_path)
         except exception.ProcessExecutionError:
             msg = (_('Failed to create share %(share)s from '
                      'snapshot %(snapshot)s.') %
@@ -596,8 +535,7 @@ class KNFSHelper(NASHelperBase):
         super(KNFSHelper, self).__init__(execute, config_object)
         self._execute = execute
         try:
-            self._execute('exportfs', check_exit_code=True,
-                          run_as_root=True)
+            self._execute('exportfs', check_exit_code=True)
         except exception.ProcessExecutionError:
             msg = (_('NFS server not found'))
             LOG.error(msg)
@@ -629,7 +567,7 @@ class KNFSHelper(NASHelperBase):
 
         # check if present in export
         try:
-            out, _ = self._execute('exportfs', run_as_root=True)
+            out, _ = self._execute('exportfs')
         except exception.ProcessExecutionError:
             msg = (_('Failed to check exports on the systems.'))
             LOG.error(msg)
@@ -647,7 +585,6 @@ class KNFSHelper(NASHelperBase):
             try:
                 self._execute('exportfs', '-o', export_opts,
                               ':'.join([access, local_path]),
-                              run_as_root=True,
                               check_exit_code=True)
             except exception.ProcessExecutionError:
                 msg = (_('Failed to allow access for share %s.') %
@@ -662,7 +599,6 @@ class KNFSHelper(NASHelperBase):
             try:
                 self._execute('exportfs', '-u',
                               ':'.join([access, local_path]),
-                              run_as_root=True,
                               check_exit_code=False)
             except exception.ProcessExecutionError:
                 msg = (_('Failed to deny access for share %s.') %
