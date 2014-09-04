@@ -372,8 +372,6 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
     def delete_share(self, ctx, share, share_server=None):
         """Remove and cleanup share storage."""
-        location = self._get_share_path(share)
-        self._get_helper(share).remove_export(location, share)
         self._delete_share(share)
 
     def delete_snapshot(self, context, snapshot, share_server=None):
@@ -514,10 +512,6 @@ class NASHelperBase(object):
         """Construct location of new export."""
         return ':'.join([self.configuration.gpfs_share_export_ip, local_path])
 
-    def remove_export(self, local_path, share):
-        """Remove export."""
-        raise NotImplementedError()
-
     def allow_access(self, local_path, share, access_type, access):
         """Allow access to the host."""
         raise NotImplementedError()
@@ -557,10 +551,6 @@ class KNFSHelper(NASHelperBase):
             options = self.configuration.knfs_export_options
 
         return options
-
-    def remove_export(self, local_path, share):
-        """Remove export."""
-        pass
 
     def allow_access(self, local_path, share, access_type, access):
         """Allow access to one or more vm instances."""
@@ -634,29 +624,6 @@ class GNFSHelper(NASHelperBase):
                 LOG.error(msg)
 
         return options
-
-    def remove_export(self, local_path, share):
-        """Remove export."""
-        cfgpath = self.configuration.ganesha_config_path
-        gservice = self.configuration.ganesha_service_name
-        gservers = self.configuration.gpfs_nfs_server_list
-        sshlogin = self.configuration.gpfs_login
-        sshkey = self.configuration.gpfs_private_key
-        dbport = self.configuration.dbus_port
-        pre_lines, exports = ganesha_utils.parse_ganesha_config(cfgpath)
-
-        export = ganesha_utils.get_export_by_path(exports, local_path)
-        if export:
-            exports.pop(export['export_id'])
-            LOG.info(_('Remove export for %s') % share['name'])
-            # publish config to all servers and reload or restart
-            ganesha_utils.publish_ganesha_config(gservers, sshlogin, sshkey,
-                                                 cfgpath, pre_lines, exports)
-            ganesha_utils.reload_ganesha_config(gservers, sshlogin,
-                                                dbport, gservice)
-        else:
-            LOG.info(_('Export for %s is not defined in Ganesha config.') %
-                     share['name'])
 
     def allow_access(self, local_path, share, access_type, access):
         """Allow access to the host."""
