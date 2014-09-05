@@ -43,6 +43,7 @@ from manila.openstack.common import importutils
 from manila.openstack.common import log as logging
 from manila.share import driver
 from manila.share.drivers.ganesha import GaneshaNASHelper
+from manila.share.drivers.ganesha import NASHelperBase
 from manila.share.drivers.ganesha import utils as ganeshautils
 
 LOG = logging.getLogger(__name__)
@@ -341,12 +342,15 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
             LOG.error(msg)
             raise exception.GPFSException(msg)
 
+    def _create_export(self, local_path, share):
+        """Construct location of new export."""
+        return ':'.join([self.configuration.gpfs_share_export_ip, local_path])
+
     def create_share(self, ctx, share, share_server=None):
         """Create GPFS directory that will be represented as share."""
         self._create_share(share, '%sG' % share['size'])
         share_path = self._get_share_path(share)
-        location = self._get_helper(share).create_export(share_path,
-                                                         share)
+        location = self._create_export(share_path, share)
         return location
 
     def create_share_from_snapshot(self, ctx, share, snapshot,
@@ -354,8 +358,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         """Is called to create share from a snapshot."""
         share_path = self._get_share_path(share)
         self._create_share_from_snapshot(share, snapshot, share_path)
-        location = self._get_helper(share).create_export(share_path,
-                                                         share)
+        location = self._create_export(share_path, share)
         return location
 
     def create_snapshot(self, context, snapshot, share_server=None):
@@ -377,16 +380,12 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
     def allow_access(self, ctx, share, access, share_server=None):
         """Allow access to the share."""
         location = self._get_share_path(share)
-        self._get_helper(share).allow_access(location, share,
-                                             access['access_type'],
-                                             access['access_to'])
+        self._get_helper(share).allow_access(location, share, access)
 
     def deny_access(self, ctx, share, access, share_server=None):
         """Deny access to the share."""
         location = self._get_share_path(share)
-        self._get_helper(share).deny_access(location, share,
-                                            access['access_type'],
-                                            access['access_to'])
+        self._get_helper(share).deny_access(location, share, access)
 
     def check_for_setup_error(self):
         """Returns an error if prerequisites aren't met."""
@@ -432,8 +431,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         """Any initialization the volume driver does while starting."""
         super(GPFSShareDriver, self).do_setup(context)
         self._setup_helpers()
-        for helper in self._helpers.values():
-            helper.init()
+        self._helper.init_helper()
 
     def get_share_stats(self, refresh=False):
         """Get share status.
@@ -490,30 +488,6 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
                             snapshot["name"])
 
 
-class NASHelperBase(object):
-    """Interface to work with share."""
-
-    def __init__(self, execute, config_object):
-        self.configuration = config_object
-        self._execute = execute
-
-    def init(self):
-        pass
-
-    def create_export(self, local_path, share, recreate=False):
-        """Construct location of new export."""
-        return ':'.join([self.configuration.gpfs_share_export_ip, local_path])
-
-    def allow_access(self, local_path, share, access_type, access):
-        """Allow access to the host."""
-        raise NotImplementedError()
-
-    def deny_access(self, local_path, share, access_type, access,
-                    force=False):
-        """Deny access to the host."""
-        raise NotImplementedError()
-
-
 class KNFSHelper(NASHelperBase):
     """Wrapper for Kernel NFS Commands."""
 
@@ -544,7 +518,7 @@ class KNFSHelper(NASHelperBase):
 
         return options
 
-    def allow_access(self, local_path, share, access_type, access):
+    def allow_access(self, local_path, share, access):
         """Allow access to one or more vm instances."""
 
         # check if present in export
@@ -555,18 +529,20 @@ class KNFSHelper(NASHelperBase):
             LOG.error(msg)
             raise exception.GPFSException(msg)
 
-        out = re.search(re.escape(local_path) + '[\s\n]*' + re.escape(access),
+        access_to = access['access_to']
+
+        out = re.search(re.escape(local_path) + '[\s\n]*' + re.escape(access_to),
                         out)
         if out is not None:
-            raise exception.ShareAccessExists(access_type=access_type,
-                                              access=access)
+            raise exception.ShareAccessExists(access_type=access['access_type'],
+                                              access=access_to)
 
         export_opts = self._get_export_options(share)
 
         for server in self.configuration.gpfs_nfs_server_list:
             try:
                 self._execute('exportfs', '-o', export_opts,
-                              ':'.join([access, local_path]),
+                              ':'.join([access_to, local_path]),
                               check_exit_code=True)
             except exception.ProcessExecutionError:
                 msg = (_('Failed to allow access for share %s.') %
@@ -574,13 +550,12 @@ class KNFSHelper(NASHelperBase):
                 LOG.error(msg)
                 raise exception.GPFSException(msg)
 
-    def deny_access(self, local_path, share, access_type, access,
-                    force=False):
+    def deny_access(self, local_path, share, access):
         """Remove access for one or more vm instances."""
         for server in self.configuration.gpfs_nfs_server_list:
             try:
                 self._execute('exportfs', '-u',
-                              ':'.join([access, local_path]),
+                              ':'.join([access['access_to'], local_path]),
                               check_exit_code=False)
             except exception.ProcessExecutionError:
                 msg = (_('Failed to deny access for share %s.') %
