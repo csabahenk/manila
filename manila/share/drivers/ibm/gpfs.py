@@ -30,7 +30,6 @@ Limitation:
 
 """
 
-from copy import copy
 import math
 import os
 import re
@@ -43,7 +42,7 @@ from manila import exception
 from manila.openstack.common import importutils
 from manila.openstack.common import log as logging
 from manila.share import driver
-from manila.share.drivers.ibm import ganesha_utils
+from manila.share.drivers.ganesha import GaneshaNASHelper
 from manila.share.drivers.ganesha import utils as ganeshautils
 
 LOG = logging.getLogger(__name__)
@@ -103,26 +102,6 @@ gpfs_share_opts = [
                      'NFS server. Note that these defaults can be overridden '
                      'when a share is created by passing metadata with key '
                      'name export_options')),
-    cfg.StrOpt('gnfs_export_options',
-               default=('maxread = 65536, prefread = 65536'),
-               help=('Options to use when exporting a share using ganesha'
-                     'NFS server. Note that these defaults can be overridden'
-                     'when a share is created by passing metadata with key '
-                     'name export_options.  Also note the complete set of '
-                     'default ganesha export options is specified in '
-                     'ganesha_utils.')),
-    cfg.StrOpt('ganesha_config_path',
-               default='/etc/ganesha/ganesha_exports.conf',
-               help=('Path to ganesha export config file.  The config file '
-                     'may also contain non-export configuration data but it'
-                     'must be placed before the EXPORT clauses.')),
-    cfg.StrOpt('ganesha_service_name',
-               default='ganesha.nfsd',
-               help=('Name of the ganesha nfs service.')),
-    cfg.StrOpt('dbus_port',
-               default='55557',
-               help=('Port to use when communicating with DBUS for Ganesha '
-                     'management.')),
 ]
 
 
@@ -137,7 +116,6 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         """Do initialization."""
         super(GPFSShareDriver, self).__init__(*args, **kwargs)
         self.db = db
-        self._helpers = {}
         self.configuration.append_config_values(gpfs_share_opts)
         self.backend_name = self.configuration.safe_get(
             'share_backend_name') or "IBM Storage System"
@@ -198,12 +176,26 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
     def _setup_helpers(self):
         """Initializes protocol-specific NAS drivers."""
-        self._helpers = {}
-        for helper_str in self.configuration.gpfs_share_helpers:
+        conf = self.configuration
+        hdic = {}
+        for helper_str in conf.gpfs_share_helpers:
             share_proto, _, import_str = helper_str.partition('=')
-            helper = importutils.import_class(import_str)
-            self._helpers[share_proto.upper()] = helper(self._gpfs_execute,
-                                                        self.configuration)
+            hdic[share_proto] = importutils.import_class(import_str)
+
+        if conf.gpfs_nfs_server_type == 'KNFS':
+            self._helper = hdic['KNFS'](self._gpfs_execute, conf)
+        elif conf.gpfs_nfs_server_type == 'GNFS':
+            _GHC = hdic['GNFS']
+            execs = [ganeshautils.RootExecutor()] + [
+              ganeshautils.SSHExecutor(srv, 22, None, conf.gpfs_login,
+                     privatekey=conf.gpfs_private_key) for
+                srv in conf.gpfs_nfs_server_list
+            ]
+            self._helper = ganeshautils.Mux([_GHC(ex, conf) for ex in execs])
+        else:
+            msg = _('Unknown NFS server type %s.') % conf.gpfs_nfs_server_type
+            LOG.error(msg)
+            raise exception.GPFSException(msg)
 
     def _local_path(self, shareobj):
         """Get local path for a share or share snapshot by name."""
@@ -478,7 +470,7 @@ class GPFSShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
     def _get_helper(self, share):
         if share['share_proto'].startswith('NFS'):
-            return self._helpers[self.configuration.gpfs_nfs_server_type]
+            return self._helper
         else:
             msg = (_('Share protocol %s not supported by GPFS driver') %
                    share['share_proto'])
@@ -597,117 +589,14 @@ class KNFSHelper(NASHelperBase):
                 raise exception.GPFSException(msg)
 
 
-class GNFSHelper(NASHelperBase):
+class GNFSHelper(GaneshaNASHelper):
     """Wrapper for Ganesha NFS Commands."""
 
-    def __init__(self, execute, config_object):
-        super(GNFSHelper, self).__init__(execute, config_object)
-        self.default_export_options = dict()
-        for m in AVPATTERN.finditer(self.configuration.gnfs_export_options):
-            self.default_export_options[m.group('attr')] = m.group('val')
+    def _default_config_hook(self):
+        dconf = super(GNFSHelper, self)._default_config_hook()
+        conf_dir = ganeshautils.path_from(__file__, "conf")
+        ganeshautils.patch(dconf, self._load_conf_dir(conf_dir))
+        return dconf
 
-    def _get_export_options(self, share):
-        """Set various export attributes for share."""
-
-        # load default options first - any options passed as share metadata
-        # will take precedence
-        options = copy(self.default_export_options)
-
-        metadata = share.get('share_metadata')
-        for item in metadata:
-            attr = item['key']
-            if attr in ganesha_utils.valid_flags():
-                options[attr] = item['value']
-            else:
-                msg = (_('Invalid metadata %(attr)s for share %(share)s') %
-                       {'attr': attr, 'share': share['name']})
-                LOG.error(msg)
-
-        return options
-
-    def allow_access(self, local_path, share, access_type, access):
-        """Allow access to the host."""
-        # TODO(nileshb):  add support for read only, metadata, and other
-        # access types
-        reload_needed = True
-        cfgpath = self.configuration.ganesha_config_path
-        gservice = self.configuration.ganesha_service_name
-        gservers = self.configuration.gpfs_nfs_server_list
-        sshlogin = self.configuration.gpfs_login
-        sshkey = self.configuration.gpfs_private_key
-        dbport = self.configuration.dbus_port
-        pre_lines, exports = ganesha_utils.parse_ganesha_config(cfgpath)
-
-        export_opts = self._get_export_options(share)
-
-        # add the new share if it's not already defined
-        if not ganesha_utils.export_exists(exports, local_path):
-            # Add a brand new export definition
-            new_id = ganesha_utils.get_next_id(exports)
-            export = ganesha_utils.get_export_template()
-            export['fsal'] = '"GPFS"'
-            export['export_id'] = new_id
-            export['tag'] = '"fs%s"' % new_id
-            export['path'] = '"%s"' % local_path
-            export['pseudo'] = '"%s"' % local_path
-            export['rw_access'] = ('"%s"' %
-                                   ganesha_utils.format_access_list(access))
-            for key in export_opts:
-                export[key] = export_opts[key]
-
-            exports[new_id] = export
-            LOG.info(_('Add %(share)s with access from %(access)s') %
-                     {'share': share['name'], 'access': access})
-        else:
-            # Update existing access with new / extended access information
-            export = ganesha_utils.get_export_by_path(exports, local_path)
-            initial_access = export['rw_access'].strip('"')
-            merged_access = ','.join([access, initial_access])
-            updated_access = ganesha_utils.format_access_list(merged_access)
-            if initial_access != updated_access:
-                LOG.info(_('Update %(share)s with access from %(access)s') %
-                         {'share': share['name'], 'access': access})
-                export['rw_access'] = '"%s"' % updated_access
-            else:
-                LOG.info(_('Do not update %(share)s, access from %(access)s '
-                           'already defined') % {'share': share['name'],
-                                                 'access': access})
-                reload_needed = False
-
-        if reload_needed:
-            # publish config to all servers and reload or restart
-            ganesha_utils.publish_ganesha_config(gservers, sshlogin, sshkey,
-                                                 cfgpath, pre_lines, exports)
-            ganesha_utils.reload_ganesha_config(gservers, sshlogin, dbport,
-                                                gservice)
-
-    def deny_access(self, local_path, share, access_type, access,
-                    force=False):
-        """Deny access to the host."""
-        cfgpath = self.configuration.ganesha_config_path
-        gservice = self.configuration.ganesha_service_name
-        gservers = self.configuration.gpfs_nfs_server_list
-        sshlogin = self.configuration.gpfs_login
-        sshkey = self.configuration.gpfs_private_key
-        dbport = self.configuration.dbus_port
-        pre_lines, exports = ganesha_utils.parse_ganesha_config(cfgpath)
-
-        export = ganesha_utils.get_export_by_path(exports, local_path)
-        initial_access = export['rw_access'].strip('"')
-        updated_access = ganesha_utils.format_access_list(initial_access,
-                                                          deny_access=access)
-        if initial_access != updated_access:
-            LOG.info(_('Update %(share)s removing access from %(access)s') %
-                     {'share': share['name'], 'access': access})
-            export['rw_access'] = '"%s"' % updated_access
-
-            # publish config to all servers and reload or restart
-            ganesha_utils.publish_ganesha_config(gservers, sshlogin, sshkey,
-                                                 cfgpath, pre_lines, exports)
-            ganesha_utils.reload_ganesha_config(gservers, sshlogin, dbport,
-                                                gservice)
-
-        else:
-            LOG.info(_('Do not update %(share)s, access from %(access)s '
-                       'already removed') % {'share': share['name'],
-                                             'access': access})
+    def _fsal_hook(self, *_args):
+        return {"Name": "GPFS"}
