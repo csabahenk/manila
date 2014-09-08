@@ -414,3 +414,23 @@ class GlusterNFSHelper(NASHelperBase):
                 ddict.pop(edir)
         self._manage_access(share['name'], access['access_type'],
                             access['access_to'], cbk)
+
+
+class GaneshaNFSHelper(GaneshaNASHelper):
+
+    def __init__(self, execute, config_object, **kwargs):
+        self.gluster_address = kwargs.pop('gluster_address')
+        execute = ganeshautils.RootExecutor(execute)
+        super(GaneshaNFSHelper, self).__init__(execute, config_object,
+                                               **kwargs)
+
+    def _default_config_hook(self):
+        dconf = super(GaneshaNFSHelper, self)._default_config_hook()
+        conf_dir = ganeshautils.path_from(__file__, "glusterfs", "conf")
+        ganeshautils.patch(dconf, self._load_conf_dir(conf_dir))
+        return dconf
+
+    def _fsal_hook(self, base, share, access):
+        return {"Hostname": self.gluster_address.host,
+                "Volume":  self.gluster_address.volume,
+                "Volpath": "/" + share['name']}
