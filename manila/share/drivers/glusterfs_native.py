@@ -27,7 +27,9 @@ Supports working with multiple glusterfs volumes.
 
 import errno
 import pipes
+import re
 import shutil
+import string
 import tempfile
 import xml.etree.cElementTree as etree
 
@@ -46,11 +48,11 @@ from manila import utils
 LOG = log.getLogger(__name__)
 
 glusterfs_native_manila_share_opts = [
-    cfg.ListOpt('glusterfs_targets',
+    cfg.ListOpt('glusterfs_servers',
                 default=[],
-                help='List of GlusterFS volumes that can be used to create '
-                     'shares. Each GlusterFS volume should be of the form '
-                     '[remoteuser@]<volserver>:/<volid>'),
+                help='List of GlusterFS servers that can be used to create '
+                     'shares. Each GlusterFS server should be of the form '
+                     '[remoteuser@]<volserver>'),
     cfg.StrOpt('glusterfs_native_server_password',
                default=None,
                secret=True,
@@ -61,6 +63,14 @@ glusterfs_native_manila_share_opts = [
     cfg.StrOpt('glusterfs_native_path_to_private_key',
                default=None,
                help='Path of Manila host\'s private SSH key file.'),
+    cfg.StrOpt('gluster_volume_pattern',
+               default=None,
+               help='Regular expression template used to filter '
+                    'GlusterFS volumes for share creation. '
+                    'The regex template can contain the ${size} '
+                    'parameter which matches a number (sequence of '
+                    'digits) and the value shall be intepreted as '
+                    'size of the volume in GB.')
 ]
 
 CONF = cfg.CONF
@@ -71,6 +81,7 @@ AUTH_SSL_ALLOW = 'auth.ssl-allow'
 CLIENT_SSL = 'client.ssl'
 NFS_EXPORT_VOL = 'nfs.export-volumes'
 SERVER_SSL = 'server.ssl'
+PATTERN_DICT = {'size': {'pattern': '(?P<size>\d+)', 'trans': int}}
 
 
 class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
@@ -90,13 +101,32 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
             False, *args, **kwargs)
         self.db = db
         self._helpers = None
-        self.gluster_unused_vols_dict = {}
         self.gluster_used_vols_dict = {}
         self.configuration.append_config_values(
             glusterfs_native_manila_share_opts)
         self.gluster_nosnap_vols_dict = {}
         self.backend_name = self.configuration.safe_get(
             'share_backend_name') or 'GlusterFS-Native'
+        self.volume_pattern = self._compile_volume_pattern()
+        self.volume_pattern_keys = self.volume_pattern.groupindex.keys()
+        gluster_servers = {}
+        for srvaddr in self.configuration.gluster_servers:
+            gluster_servers[srvaddr] = self._glustermanager(
+                srvaddr, has_volume=False)
+        self.gluster_servers = gluster_servers
+
+    def _compile_volume_pattern(self):
+        """Compile a RegexObject from the config specified regex template.
+
+        (cfg.gluster_volume_pattern)
+        """
+
+        subdict = {}
+        for key, val in six.iteritems(PATTERN_DICT):
+            subdict[key] = val['pattern']
+        volume_pattern = string.Template(
+            self.configuration.gluster_volume_pattern).substitute(subdict)
+        return re.compile(volume_pattern)
 
     def do_setup(self, context):
         """Setup the GlusterFS volumes."""
@@ -104,18 +134,18 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
         # We don't use a service mount as its not necessary for us.
         # Do some sanity checks.
-        if len(self.configuration.glusterfs_targets) == 0:
-            # No volumes specified in the config file. Raise exception.
-            msg = (_("glusterfs_targets list seems to be empty! "
-                     "Add one or more gluster volumes to work "
-                     "with in the glusterfs_targets configuration "
-                     "parameter."))
+        gluster_volumes0 = set(self._fetch_gluster_volumes())
+        if not gluster_volumes0:
+            # No suitable volumes are found on the Gluster end.
+            # Raise exception.
+            msg = (_("Gluster backend does not provide any volume "
+                     "matching pattern %s"
+                     ) % self.configuration.gluster_volume_pattern)
             LOG.error(msg)
             raise exception.GlusterfsException(msg)
 
-        LOG.info(_LI("Number of gluster volumes read from config: "
-                     "%(numvols)s"),
-                 {'numvols': len(self.configuration.glusterfs_targets)})
+        LOG.info(_LI("Found %d Gluster volumes allocated for Manila."
+                     ) % len(gluster_volumes0))
 
         try:
             self._execute('mount.glusterfs', check_exit_code=False)
@@ -129,24 +159,69 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
                 LOG.error(msg)
                 raise
 
-        # Update gluster_unused_vols_dict, gluster_used_vols_dict by walking
-        # through the DB.
+        # Update gluster_used_vols_dict by walking through the DB.
         self._update_gluster_vols_dict(context)
-        if len(self.gluster_unused_vols_dict) == 0:
+        unused_vols = gluster_volumes0 - set(self.gluster_used_vols_dict)
+        if not unused_vols:
             # No volumes available for use as share. Warn user.
             msg = (_("No unused gluster volumes available for use as share! "
                      "Create share won't be supported unless existing shares "
                      "are deleted or add one or more gluster volumes to work "
-                     "with in the glusterfs_targets configuration parameter."))
+                     "with in the glusterfs_servers configuration parameter."))
             LOG.warn(msg)
         else:
             LOG.info(_LI("Number of gluster volumes in use:  "
                          "%(inuse-numvols)s. Number of gluster volumes "
                          "available for use as share: %(unused-numvols)s"),
                      {'inuse-numvols': len(self.gluster_used_vols_dict),
-                     'unused-numvols': len(self.gluster_unused_vols_dict)})
+                     'unused-numvols': len(unused_vols)})
 
-        self._setup_gluster_vols()
+    def _glustermanager(self, gluster_address, has_volume=True):
+        """Create GlusterManager object for gluster_address."""
+
+        return glusterfs.GlusterManager(
+            gluster_address, self._execute,
+            self.configuration.glusterfs_native_path_to_private_key,
+            self.configuration.glusterfs_native_server_password,
+            has_volume=has_volume)
+
+    def _fetch_gluster_volumes(self):
+        """Do a 'gluster volume list | grep <volume pattern>'.
+
+        Aggregate the results from all servers.
+        Extract the named groups from the matching volume names
+        using the specs given in PATTERN_DICT.
+        Return a dict with keys of the form <server>:/<volname>
+        and values being dicts that map names of named groups
+        to their extracted value.
+        """
+
+        volumes_dict = {}
+        for gsrv, gluster_mgr in six.iteritems(self.gluster_servers):
+            try:
+                out, err = gluster_mgr.gluster_call('volume', 'list')
+            except exception.ProcessExecutionError as exc:
+                msgdict = {'err': exc.stderr, 'hostinfo': ''}
+                if gluster_mgr.remote_user:
+                    msgdict['hostinfo'] = ' on host %s' % gluster_mgr.host
+                LOG.error(_LE("Error retrieving volume list%(hostinfo)s: "
+                              "%(err)s") % msgdict)
+                raise exception.GlusterfsException(
+                    'gluster volume list failed')
+            for vol in out.split("\n"):
+                patmatch = self.volume_pattern.match(vol)
+                if not patmatch:
+                    continue
+                pattern_dict = {}
+                for key in self.volume_pattern_keys:
+                    keymatch = patmatch.group(key)
+                    if keymatch is None:
+                        pattern_dict[key] = None
+                    else:
+                        trans = PATTERN_DICT[key].get('trans', lambda x: x)
+                        pattern_dict[key] = trans(keymatch)
+                volumes_dict[gsrv + ':/' + vol] = pattern_dict
+        return volumes_dict
 
     @utils.synchronized("glusterfs_native", external=False)
     def _update_gluster_vols_dict(self, context):
@@ -154,73 +229,28 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
 
         shares = self.db.share_get_all(context)
 
-        # Store the gluster volumes in dict thats helpful to track
-        # (push and pop) in future. {gluster_export: gluster_mgr, ...}
-        # gluster_export is of form hostname:/volname which is unique
-        # enough to be used as a key.
-        self.gluster_unused_vols_dict = {}
-        self.gluster_used_vols_dict = {}
+        for s in shares:
+            vol = s['export_location']
+            gluster_mgr = self._glustermanager(vol)
+            self.gluster_used_vols_dict[vol] = gluster_mgr
 
-        for gv in self.configuration.glusterfs_targets:
-            gmgr = glusterfs.GlusterManager(
-                gv, self._execute,
-                self.configuration.glusterfs_native_path_to_private_key,
-                self.configuration.glusterfs_native_server_password)
-            exp_locn_gv = gmgr.export
-
-            # Assume its unused to begin with.
-            self.gluster_unused_vols_dict.update({exp_locn_gv: gmgr})
-
-            for s in shares:
-                exp_locn_share = s.get('export_location', None)
-                if exp_locn_share == exp_locn_gv:
-                    # gluster volume is in use, move it to used list.
-                    self.gluster_used_vols_dict.update({exp_locn_gv: gmgr})
-                    self.gluster_unused_vols_dict.pop(exp_locn_gv)
-                    break
-
-    @utils.synchronized("glusterfs_native", external=False)
-    def _setup_gluster_vols(self):
+    def _setup_gluster_vol(self, vol):
         # Enable gluster volumes for SSL access only.
 
-        for gluster_mgr in six.itervalues(self.gluster_unused_vols_dict):
-
+        for option, value in six.iteritems(
+            {NFS_EXPORT_VOL: 'off', CLIENT_SSL: 'on', SERVER_SSL: 'on'}
+        ):
+            gluster_mgr = self._glustermanager(vol)
             try:
                 gluster_mgr.gluster_call(
                     'volume', 'set', gluster_mgr.volume,
-                    NFS_EXPORT_VOL, 'off')
+                    option, 'value')
             except exception.ProcessExecutionError as exc:
                 msg = (_("Error in gluster volume set during volume setup. "
-                         "Volume: %(volname)s, Option: %(option)s, "
-                         "rror: %(error)s"),
+                         "volume: %(volname)s, option: %(option)s, "
+                         "value: %(value)s, error: %(error)s") %
                        {'volname': gluster_mgr.volume,
-                        'option': NFS_EXPORT_VOL, 'error': exc.stderr})
-                LOG.error(msg)
-                raise exception.GlusterfsException(msg)
-
-            try:
-                gluster_mgr.gluster_call(
-                    'volume', 'set', gluster_mgr.volume,
-                    CLIENT_SSL, 'on')
-            except exception.ProcessExecutionError as exc:
-                msg = (_("Error in gluster volume set during volume setup. "
-                         "Volume: %(volname)s, Option: %(option)s, "
-                         "Error: %(error)s"),
-                       {'volname': gluster_mgr.volume,
-                        'option': CLIENT_SSL, 'error': exc.stderr})
-                LOG.error(msg)
-                raise exception.GlusterfsException(msg)
-
-            try:
-                gluster_mgr.gluster_call(
-                    'volume', 'set', gluster_mgr.volume,
-                    SERVER_SSL, 'on')
-            except exception.ProcessExecutionError as exc:
-                msg = (_("Error in gluster volume set during volume setup. "
-                         "Volume: %(volname)s, Option: %(option)s, "
-                         "Error: %(error)s"),
-                       {'volname': gluster_mgr.volume,
-                        'option': SERVER_SSL, 'error': exc.stderr})
+                        'option': option, 'value': value, 'error': exc.stderr})
                 LOG.error(msg)
                 raise exception.GlusterfsException(msg)
 
@@ -228,8 +258,10 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
             # set dynamically.
             self._restart_gluster_vol(gluster_mgr)
 
-    def _restart_gluster_vol(self, gluster_mgr):
+    @staticmethod
+    def _restart_gluster_vol(gluster_mgr):
         try:
+            # XXX Why '--mode=script' ?
             gluster_mgr.gluster_call(
                 'volume', 'stop', gluster_mgr.volume, '--mode=script')
         except exception.ProcessExecutionError as exc:
@@ -250,27 +282,67 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
             raise exception.GlusterfsException(msg)
 
     @utils.synchronized("glusterfs_native", external=False)
-    def _pop_gluster_vol(self):
-        try:
-            exp_locn, gmgr = self.gluster_unused_vols_dict.popitem()
-        except KeyError:
+    def _pop_gluster_vol(self, size=None):
+        """Pick an unbound volume.
+
+        Do a _fetch_gluster_volumes() first to get the complete
+        list of usable volumes.
+        Keep only the unbound ones (ones that are not yet used to
+        back a share).
+        If size is given, try to pick one which has a size specification
+        (according to the 'size' named group of the volume pattern),
+        and its size is greater-than-or-equal to the given size.
+        Return the volume chosen (in <host>:/<volname> format).
+        """
+
+        voldict = self._fetch_gluster_volumes()
+        # calculate the set of unused volumes
+        set1, set2 = (
+            set(d) for d in (voldict, self.gluster_used_vols_dict)
+        )
+        unused_vols = set1 - set2
+        # if both caller has specified size and 'size' occurs as
+        # a parameter in the volume pattern...
+        if size and 'size' in self.volume_pattern_keys:
+            # ... then create a list that stores those of the unused volumes
+            # (along with their sizes) which are indicated to have a suitable
+            # size; and another list for the ones for which no size is given.
+            sized_unused_vols, unsized_unused_vols = [], []
+            for vol in unused_vols:
+                volsize = voldict[vol]['size']
+                if volsize:
+                    if volsize >= size:
+                        sized_unused_vols.append([volsize, vol])
+                else:
+                    unsized_unused_vols.append(vol)
+        else:
+            # ... else just use a stub for the "sized" list
+            # and put all unused ones to the "unsized" list
+            sized_unused_vols = []
+            unsized_unused_vols = unused_vols
+
+        if sized_unused_vols:
+            sized_unused_vols.sort()
+            vol = sized_unused_vols[0][1]
+        elif unsized_unused_vols:
+            vol = unsized_unused_vols[0]
+        else:
             msg = (_("Couldn't find a free gluster volume to use."))
             LOG.error(msg)
             raise exception.GlusterfsException(msg)
 
-        self.gluster_used_vols_dict.update({exp_locn: gmgr})
-        return exp_locn
+        self._setup_gluster_vol(vol)
+        self.gluster_used_vols_dict[vol] = self._glustermanager[vol]
+        return vol
 
     @utils.synchronized("glusterfs_native", external=False)
     def _push_gluster_vol(self, exp_locn):
         try:
-            gmgr = self.gluster_used_vols_dict.pop(exp_locn)
+            self.gluster_used_vols_dict.pop(exp_locn)
         except KeyError:
             msg = (_("Couldn't find the share in used list."))
             LOG.error(msg)
             raise exception.GlusterfsException(msg)
-
-        self.gluster_unused_vols_dict.update({exp_locn: gmgr})
 
     def _do_mount(self, gluster_export, mntdir):
 
@@ -390,7 +462,7 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         GlusterFS volume for use as a share.
         """
         try:
-            export_location = self._pop_gluster_vol()
+            export_location = self._pop_gluster_vol(share['size'])
         except exception.GlusterfsException:
             msg = (_("Error creating share %(share_id)s"),
                    {'share_id': share['id']})
