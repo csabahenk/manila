@@ -18,7 +18,7 @@
 Test cases for GlusterFS native protocol driver.
 """
 
-
+import re
 import shutil
 import tempfile
 
@@ -97,45 +97,95 @@ class GlusterfsNativeShareDriverTestCase(test.TestCase):
         self._execute = fake_utils.fake_execute
         self._context = context.get_admin_context()
 
-        self.gluster_target1 = 'root@host1:/gv1'
-        self.gluster_target2 = 'root@host2:/gv2'
-        CONF.set_default('glusterfs_targets',
-                         [self.gluster_target1, self.gluster_target2])
+        self.glusterfs_server1 = 'root@host1'
+        self.glusterfs_server2 = 'root@host2'
+        self.glusterfs_server1_volumes = 'manila-share-1-1G\nshare1'
+        self.glusterfs_server2_volumes = 'manila-share-2-2G\nshare2'
+        self.glusterfs_volumes_dict = (
+            {'root@host1:/manila-share-1-1G': {'size': 1},
+             'root@host2:/manila-share-2-2G': {'size': 2}})
+
+        CONF.set_default('glusterfs_servers',
+                         [self.glusterfs_server1, self.glusterfs_server2])
         CONF.set_default('glusterfs_server_password',
                          'fake_password')
         CONF.set_default('glusterfs_path_to_private_key',
                          '/fakepath/to/privatekey')
+        CONF.set_default('gluster_volume_pattern',
+                         'manila-share-\d+-${size}G')
         CONF.set_default('driver_handles_share_servers', False)
 
         self.fake_conf = config.Configuration(None)
         self._db = mock.Mock()
-        self._driver = glusterfs_native.GlusterfsNativeShareDriver(
-            self._db, execute=self._execute,
-            configuration=self.fake_conf)
         self.mock_object(tempfile, 'mkdtemp',
                          mock.Mock(return_value='/tmp/tmpKGHKJ'))
         self.mock_object(glusterfs.GlusterManager, 'make_gluster_call')
+        volume_pattern = 'manila-share-\d+-(?P<size>\d+)G'
+        with mock.patch.object(glusterfs_native.GlusterfsNativeShareDriver,
+                               '_compile_volume_pattern',
+                               return_value=re.compile(volume_pattern)):
+            self._driver = glusterfs_native.GlusterfsNativeShareDriver(
+                self._db, execute=self._execute, configuration=self.fake_conf)
+        gmgr = glusterfs.GlusterManager
+        self.gmgr1 = gmgr(self.glusterfs_server1, self._execute, None, None,
+                          has_volume=False)
+        self.gmgr2 = gmgr(self.glusterfs_server2, self._execute, None, None,
+                          has_volume=False)
+        self._driver.glusterfs_servers = {self.glusterfs_server1: self.gmgr1,
+                                          self.glusterfs_server2: self.gmgr2}
         self.addCleanup(fake_utils.fake_execute_set_repliers, [])
         self.addCleanup(fake_utils.fake_execute_clear_log)
 
+    def test_compile_volume_pattern(self):
+        volume_pattern = 'manila-share-\d+-(?P<size>\d+)G'
+        ret = self._driver._compile_volume_pattern()
+        self.assertEqual(re.compile(volume_pattern), ret)
+
+    def test_fetch_gluster_volumes(self):
+        test_args = ('volume', 'list')
+        self.mock_object(
+            self.gmgr1, 'gluster_call',
+            mock.Mock(return_value=(self.glusterfs_server1_volumes, '')))
+        self.mock_object(
+            self.gmgr2, 'gluster_call',
+            mock.Mock(return_value=(self.glusterfs_server2_volumes, '')))
+        expected_output = self.glusterfs_volumes_dict
+        ret = self._driver._fetch_gluster_volumes()
+        self.gmgr1.gluster_call.assert_called_once_with(*test_args)
+        self.gmgr2.gluster_call.assert_called_once_with(*test_args)
+        self.assertEqual(expected_output, ret)
+
+    def test_fetch_gluster_volumes_error(self):
+        self._driver.glusterfs_servers={self.glusterfs_server1: self.gmgr1}
+        test_args = ('volume', 'list')
+
+        def raise_exception(*args, **kwargs):
+            if(args == test_args):
+                raise exception.ProcessExecutionError()
+
+        self.mock_object(self.gmgr1, 'gluster_call',
+                         mock.Mock(side_effect=raise_exception))
+        self.mock_object(glusterfs_native.LOG, 'error')
+        self.assertRaises(exception.GlusterfsException,
+                          self._driver._fetch_gluster_volumes)
+        self.gmgr1.gluster_call.assert_called_once_with(*test_args)
+        self.assertTrue(glusterfs_native.LOG.error.called)
+
     def test_do_setup(self):
-        self._driver._setup_gluster_vols = mock.Mock()
-        self._db.share_get_all = mock.Mock(return_value=[])
+        self.mock_object(self._driver, '_fetch_gluster_volumes',
+                         mock.Mock(return_value=self.glusterfs_volumes_dict))
+        self.mock_object(self._driver, '_update_gluster_vols_dict')
+        self._driver.gluster_used_vols_dict = self.glusterfs_volumes_dict
+        self.mock_object(glusterfs_native.LOG, 'warn')
         expected_exec = ['mount.glusterfs']
-        gmgr = glusterfs.GlusterManager
 
         self._driver.do_setup(self._context)
 
-        self.assertEqual(2, len(self._driver.gluster_unused_vols_dict))
-        self.assertTrue(
-            gmgr(self.gluster_target1, self._execute, None, None).export in
-            self._driver.gluster_unused_vols_dict)
-        self.assertTrue(
-            gmgr(self.gluster_target2, self._execute, None, None).export in
-            self._driver.gluster_unused_vols_dict)
-        self.assertTrue(self._driver._setup_gluster_vols.called)
-        self.assertTrue(self._db.share_get_all.called)
+        self._driver._fetch_gluster_volumes.assert_called_once_with()
         self.assertEqual(expected_exec, fake_utils.fake_execute_get_log())
+        self._driver._update_gluster_vols_dict.assert_called_once_with(
+            self._context)
+        glusterfs_native.LOG.warn.assert_called_once_with(mock.ANY)
 
     def test_do_setup_glusterfs_targets_empty(self):
         self._driver.configuration.glusterfs_targets = []
