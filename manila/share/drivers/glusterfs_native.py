@@ -52,7 +52,8 @@ glusterfs_native_manila_share_opts = [
                 default=[],
                 help='List of GlusterFS servers that can be used to create '
                      'shares. Each GlusterFS server should be of the form '
-                     '[remoteuser@]<volserver>'),
+                     '[remoteuser@]<volserver>, and they are assumed to '
+                     'belong to distinct Gluster clusters.'),
     cfg.StrOpt('glusterfs_native_server_password',
                default=None,
                secret=True,
@@ -63,14 +64,21 @@ glusterfs_native_manila_share_opts = [
     cfg.StrOpt('glusterfs_native_path_to_private_key',
                default=None,
                help='Path of Manila host\'s private SSH key file.'),
-    cfg.StrOpt('gluster_volume_pattern',
+    cfg.StrOpt('glusterfs_volume_pattern',
                default=None,
                help='Regular expression template used to filter '
                     'GlusterFS volumes for share creation. '
                     'The regex template can contain the ${size} '
                     'parameter which matches a number (sequence of '
                     'digits) and the value shall be intepreted as '
-                    'size of the volume in GB.')
+                    'size of the volume in GB. Examples: '
+                    '"manila-share-volume-\d+$", '
+                    '"manila-share-volume-${size}G-\d+$"; '
+                    'with matching volume names, respectively: '
+                    '"manila-share-volume-12", "manila-share-volume-3G-13". '
+                    'In latter example, the number that matches "${size}", '
+                    'that is, 3, is an indication that the size of volume '
+                    'is 3G.')
 ]
 
 CONF = cfg.CONF
@@ -109,23 +117,23 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
             'share_backend_name') or 'GlusterFS-Native'
         self.volume_pattern = self._compile_volume_pattern()
         self.volume_pattern_keys = self.volume_pattern.groupindex.keys()
-        gluster_servers = {}
-        for srvaddr in self.configuration.gluster_servers:
-            gluster_servers[srvaddr] = self._glustermanager(
+        glusterfs_servers = {}
+        for srvaddr in self.configuration.glusterfs_servers:
+            glusterfs_servers[srvaddr] = self._glustermanager(
                 srvaddr, has_volume=False)
-        self.gluster_servers = gluster_servers
+        self.glusterfs_servers = glusterfs_servers
 
     def _compile_volume_pattern(self):
         """Compile a RegexObject from the config specified regex template.
 
-        (cfg.gluster_volume_pattern)
+        (cfg.glusterfs_volume_pattern)
         """
 
         subdict = {}
         for key, val in six.iteritems(PATTERN_DICT):
             subdict[key] = val['pattern']
         volume_pattern = string.Template(
-            self.configuration.gluster_volume_pattern).substitute(subdict)
+            self.configuration.glusterfs_volume_pattern).substitute(subdict)
         return re.compile(volume_pattern)
 
     def do_setup(self, context):
@@ -140,7 +148,7 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
             # Raise exception.
             msg = (_("Gluster backend does not provide any volume "
                      "matching pattern %s"
-                     ) % self.configuration.gluster_volume_pattern)
+                     ) % self.configuration.glusterfs_volume_pattern)
             LOG.error(msg)
             raise exception.GlusterfsException(msg)
 
@@ -197,7 +205,7 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
         """
 
         volumes_dict = {}
-        for gsrv, gluster_mgr in six.iteritems(self.gluster_servers):
+        for gsrv, gluster_mgr in six.iteritems(self.glusterfs_servers):
             try:
                 out, err = gluster_mgr.gluster_call('volume', 'list')
             except exception.ProcessExecutionError as exc:

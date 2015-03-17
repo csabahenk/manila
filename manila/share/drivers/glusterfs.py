@@ -115,7 +115,7 @@ class GlusterManager(object):
                 m = None
         if not m:
             raise exception.GlusterfsException(
-                _('Invalid gluster address %s.'), address)
+                _('Invalid gluster address %s.') % address)
         self.remote_user = m.group('user')
         self.host = m.group('host')
         self.qualified = address
