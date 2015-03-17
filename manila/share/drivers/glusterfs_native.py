@@ -216,8 +216,8 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
                               "%(err)s") % msgdict)
                 raise exception.GlusterfsException(
                     'gluster volume list failed')
-            for vol in out.split("\n"):
-                patmatch = self.volume_pattern.match(vol)
+            for volname in out.split("\n"):
+                patmatch = self.volume_pattern.match(volname)
                 if not patmatch:
                     continue
                 pattern_dict = {}
@@ -228,7 +228,7 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
                     else:
                         trans = PATTERN_DICT[key].get('trans', lambda x: x)
                         pattern_dict[key] = trans(keymatch)
-                volumes_dict[gsrv + ':/' + vol] = pattern_dict
+                volumes_dict[gsrv + ':/' + volname] = pattern_dict
         return volumes_dict
 
     @utils.synchronized("glusterfs_native", external=False)
@@ -252,7 +252,7 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
             try:
                 gluster_mgr.gluster_call(
                     'volume', 'set', gluster_mgr.volume,
-                    option, 'value')
+                    option, value)
             except exception.ProcessExecutionError as exc:
                 msg = (_("Error in gluster volume set during volume setup. "
                          "volume: %(volname)s, option: %(option)s, "
@@ -340,7 +340,7 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
             raise exception.GlusterfsException(msg)
 
         self._setup_gluster_vol(vol)
-        self.gluster_used_vols_dict[vol] = self._glustermanager[vol]
+        self.gluster_used_vols_dict[vol] = self._glustermanager(vol)
         return vol
 
     @utils.synchronized("glusterfs_native", external=False)

@@ -112,7 +112,7 @@ class GlusterfsNativeShareDriverTestCase(test.TestCase):
         CONF.set_default('glusterfs_path_to_private_key',
                          '/fakepath/to/privatekey')
         CONF.set_default('gluster_volume_pattern',
-                         'manila-share-\d+-${size}G')
+                         'manila-share-\d+-${size}G$')
         CONF.set_default('driver_handles_share_servers', False)
 
         self.fake_conf = config.Configuration(None)
@@ -120,7 +120,7 @@ class GlusterfsNativeShareDriverTestCase(test.TestCase):
         self.mock_object(tempfile, 'mkdtemp',
                          mock.Mock(return_value='/tmp/tmpKGHKJ'))
         self.mock_object(glusterfs.GlusterManager, 'make_gluster_call')
-        volume_pattern = 'manila-share-\d+-(?P<size>\d+)G'
+        volume_pattern = 'manila-share-\d+-(?P<size>\d+)G$'
         with mock.patch.object(glusterfs_native.GlusterfsNativeShareDriver,
                                '_compile_volume_pattern',
                                return_value=re.compile(volume_pattern)):
@@ -156,7 +156,7 @@ class GlusterfsNativeShareDriverTestCase(test.TestCase):
         self.assertEqual(expected_output, ret)
 
     def test_fetch_gluster_volumes_error(self):
-        self._driver.glusterfs_servers={self.glusterfs_server1: self.gmgr1}
+        self._driver.glusterfs_servers = {self.glusterfs_server1: self.gmgr1}
         test_args = ('volume', 'list')
 
         def raise_exception(*args, **kwargs):
