@@ -22,6 +22,7 @@ import re
 import shutil
 import tempfile
 
+import ddt
 import mock
 from oslo_config import cfg
 
@@ -88,6 +89,7 @@ class GlusterXMLOut(object):
         return self.template % self.params, ''
 
 
+@ddt.ddt
 class GlusterfsNativeShareDriverTestCase(test.TestCase):
     """Tests GlusterfsNativeShareDriver."""
 
@@ -97,6 +99,8 @@ class GlusterfsNativeShareDriverTestCase(test.TestCase):
         self._execute = fake_utils.fake_execute
         self._context = context.get_admin_context()
 
+        self.glusterfs_target1 = 'root@host1:gv1'
+        self.glusterfs_target2 = 'root@host2:gv2'
         self.glusterfs_server1 = 'root@host1'
         self.glusterfs_server2 = 'root@host2'
         self.glusterfs_server1_volumes = 'manila-share-1-1G\nshare1'
@@ -198,7 +202,6 @@ class GlusterfsNativeShareDriverTestCase(test.TestCase):
         self._driver._update_gluster_vols_dict(self._context)
 
         self.assertEqual(1, len(self._driver.gluster_used_vols_dict))
-        self.assertEqual(1, len(self._driver.gluster_unused_vols_dict))
         self.assertTrue(self._db.share_get_all.called)
 
         share_in_use = fake_db_share1()[0]
@@ -210,112 +213,49 @@ class GlusterfsNativeShareDriverTestCase(test.TestCase):
         self.assertFalse(
             share_not_in_use['export_location'] in
             self._driver.gluster_used_vols_dict)
-        self.assertTrue(
-            share_not_in_use['export_location'] in
-            self._driver.gluster_unused_vols_dict)
-        self.assertFalse(
-            share_in_use['export_location'] in
-            self._driver.gluster_unused_vols_dict)
 
-    def test_setup_gluster_vols(self):
+    def test_setup_gluster_vol(self):
         test_args = [
-            ('volume', 'set', 'gv2', 'nfs.export-volumes', 'off'),
-            ('volume', 'set', 'gv2', 'client.ssl', 'on'),
-            ('volume', 'set', 'gv2', 'server.ssl', 'on')]
+            ('volume', 'set', 'gv1', 'nfs.export-volumes', 'off'),
+            ('volume', 'set', 'gv1', 'client.ssl', 'on'),
+            ('volume', 'set', 'gv1', 'server.ssl', 'on')]
         self._driver._restart_gluster_vol = mock.Mock()
 
         gmgr = glusterfs.GlusterManager
         gmgr1 = gmgr(self.gluster_target1, self._execute, None, None)
-        gmgr2 = gmgr(self.gluster_target2, self._execute, None, None)
+        self._driver._glustermanager = mock.Mock(return_value=gmgr1)
 
-        self._driver.gluster_used_vols_dict = {gmgr1.export: gmgr1}
-        self._driver.gluster_unused_vols_dict = {gmgr2.export: gmgr2}
-
-        self._driver._setup_gluster_vols()
-        gmgr2.gluster_call.has_calls(
+        self._driver._setup_gluster_vol(gmgr1.volume)
+        gmgr1.gluster_call.has_calls(
             mock.call(*test_args[0]),
             mock.call(*test_args[1]),
             mock.call(*test_args[2]))
         self.assertTrue(self._driver._restart_gluster_vol.called)
 
-    def test_setup_gluster_vols_excp1(self):
-        test_args = ('volume', 'set', 'gv2', 'nfs.export-volumes', 'off')
-
-        def raise_exception(*args, **kwargs):
-            if(args == test_args):
-                raise exception.ProcessExecutionError()
-
-        self._driver._restart_gluster_vol = mock.Mock()
-
-        gmgr = glusterfs.GlusterManager
-        gmgr1 = gmgr(self.gluster_target1, self._execute, None, None)
-        gmgr2 = gmgr(self.gluster_target2, self._execute, None, None)
-
-        self._driver.gluster_used_vols_dict = {gmgr1.export: gmgr1}
-        self._driver.gluster_unused_vols_dict = {gmgr2.export: gmgr2}
-        self.mock_object(gmgr2, 'gluster_call',
-                         mock.Mock(side_effect=raise_exception))
-
-        self.assertRaises(exception.GlusterfsException,
-                          self._driver._setup_gluster_vols)
-        gmgr2.gluster_call.assert_called_once_with(*test_args)
-        self.assertFalse(self._driver._restart_gluster_vol.called)
-
-    def test_setup_gluster_vols_excp2(self):
+    @ddt.data(0, 1, 2)
+    def test_setup_gluster_vols_excp(self, idx):
         test_args = [
-            ('volume', 'set', 'gv2', 'nfs.export-volumes', 'off'),
-            ('volume', 'set', 'gv2', 'client.ssl', 'on'),
-            ('volume', 'set', 'gv2', 'server.ssl', 'off')]
+            ('volume', 'set', 'gv1', 'nfs.export-volumes', 'off'),
+            ('volume', 'set', 'gv1', 'client.ssl', 'on'),
+            ('volume', 'set', 'gv1', 'server.ssl', 'off')]
 
         def raise_exception(*args, **kwargs):
-            if(args == test_args[1]):
+            if(args == test_args[idx]):
                 raise exception.ProcessExecutionError()
 
         self._driver._restart_gluster_vol = mock.Mock()
 
         gmgr = glusterfs.GlusterManager
         gmgr1 = gmgr(self.gluster_target1, self._execute, None, None)
-        gmgr2 = gmgr(self.gluster_target2, self._execute, None, None)
-
-        self._driver.gluster_used_vols_dict = {gmgr1.export: gmgr1}
-        self._driver.gluster_unused_vols_dict = {gmgr2.export: gmgr2}
-        self.mock_object(gmgr2, 'gluster_call',
+        self._driver._glustermanager = mock.Mock(return_value=gmgr1)
+        self.mock_object(gmgr1, 'gluster_call',
                          mock.Mock(side_effect=raise_exception))
 
         self.assertRaises(exception.GlusterfsException,
-                          self._driver._setup_gluster_vols)
+                          self._driver._setup_gluster_vol, gmgr1.volume)
         self.assertEqual(
-            [mock.call(*test_args[0]), mock.call(*test_args[1])],
-            gmgr2.gluster_call.call_args_list)
-        self.assertFalse(self._driver._restart_gluster_vol.called)
-
-    def test_setup_gluster_vols_excp3(self):
-        test_args = [
-            ('volume', 'set', 'gv2', 'nfs.export-volumes', 'off'),
-            ('volume', 'set', 'gv2', 'client.ssl', 'on'),
-            ('volume', 'set', 'gv2', 'server.ssl', 'on')]
-
-        def raise_exception(*args, **kwargs):
-            if(args == test_args[2]):
-                raise exception.ProcessExecutionError()
-
-        self._driver._restart_gluster_vol = mock.Mock()
-
-        gmgr = glusterfs.GlusterManager
-        gmgr1 = gmgr(self.gluster_target1, self._execute, None, None)
-        gmgr2 = gmgr(self.gluster_target2, self._execute, None, None)
-
-        self._driver.gluster_used_vols_dict = {gmgr1.export: gmgr1}
-        self._driver.gluster_unused_vols_dict = {gmgr2.export: gmgr2}
-        self.mock_object(gmgr2, 'gluster_call',
-                         mock.Mock(side_effect=raise_exception))
-
-        self.assertRaises(exception.GlusterfsException,
-                          self._driver._setup_gluster_vols)
-        self.assertEqual(
-            [mock.call(*test_args[0]), mock.call(*test_args[1]),
-             mock.call(*test_args[2])],
-            gmgr2.gluster_call.call_args_list)
+            [mock.call(*test_args[i]) for i in range(0, idx+1)],
+            gmgr1.gluster_call.call_args_list)
         self.assertFalse(self._driver._restart_gluster_vol.called)
 
     def test_restart_gluster_vol(self):
@@ -366,35 +306,38 @@ class GlusterfsNativeShareDriverTestCase(test.TestCase):
             [mock.call(*test_args[0]), mock.call(*test_args[1])],
             gmgr1.gluster_call.call_args_list)
 
-    def test_pop_gluster_vol(self):
-        gmgr = glusterfs.GlusterManager
-        gmgr1 = gmgr(self.gluster_target1, self._execute, None, None)
-        gmgr2 = gmgr(self.gluster_target2, self._execute, None, None)
 
-        self._driver.gluster_used_vols_dict = {gmgr1.export: gmgr1}
-        self._driver.gluster_unused_vols_dict = {gmgr2.export: gmgr2}
+    @ddt.data({"voldict":  {"host:/share2G": {"size":2}}, "used_vols": {}, "size": 1, "expected": "host:/share2G"},
+              {"voldict":  {"host:/share2G": {"size":2}}, "used_vols": {}, "size": 2, "expected": "host:/share2G"},
+              {"voldict":  {"host:/share2G": {"size":2}}, "used_vols": {}, "size": None, "expected": "host:/share2G"},
+              {"voldict":  {"host:/share2G": {"size":2}, "host:/share":{"size":None}}, "used_vols": {"host:/share2G": "fake_mgr"}, "size": 1, "expected": "host:/share"},
+              {"voldict":  {"host:/share2G": {"size":2}, "host:/share":{"size":None}}, "used_vols": {"host:/share2G": "fake_mgr"}, "size": 2, "expected": "host:/share"},
+              {"voldict":  {"host:/share2G": {"size":2}, "host:/share":{"size":None}}, "used_vols": {"host:/share2G": "fake_mgr"}, "size": 3, "expected": "host:/share"},
+              {"voldict":  {"host:/share2G": {"size":2}, "host:/share":{"size":None}}, "used_vols": {"host:/share2G": "fake_mgr"}, "size": None, "expected": "host:/share"},
+              {"voldict":  {"host:/share":{}}, "used_vols": {}, "size": 1, "expected": "host:/share"},
+              {"voldict":  {"host:/share":{}}, "used_vols": {}, "size": None, "expected": "host:/share"})
+    def test_pop_gluster_vol(self, voldict, used_vols, size, expected):
+        self._driver.fetch_gluster_volumes = mock.Mock(return_value=voldict)
+        self._driver.gluster_used_vols_dict = used_vols
+        self._driver.setup_gluster_vol = mock.Mock()
 
-        exp_locn = self._driver._pop_gluster_vol()
+        result = self._driver._pop_gluster_vol(size=size)
 
-        self.assertEqual(0, len(self._driver.gluster_unused_vols_dict))
-        self.assertFalse(
-            gmgr2.export in self._driver.gluster_unused_vols_dict)
-        self.assertEqual(2, len(self._driver.gluster_used_vols_dict))
-        self.assertTrue(
-            gmgr2.export in self._driver.gluster_used_vols_dict)
-        self.assertEqual(exp_locn, gmgr2.export)
+        self.assertEqual(expected, result)
+        self.assertEqual(used_vols[expected].export, result)
+        self._driver._setup_gluster_vol.assert_called_once_with(result)
 
-    def test_pop_gluster_vol_excp(self):
-        gmgr = glusterfs.GlusterManager
-        gmgr1 = gmgr(self.gluster_target1, self._execute, None, None)
-        gmgr2 = gmgr(self.gluster_target2, self._execute, None, None)
-
-        self._driver.gluster_used_vols_dict = {
-            gmgr2.export: gmgr2, gmgr1.export: gmgr1}
-        self._driver.gluster_unused_vols_dict = {}
+    @ddt.data({"voldict":  {"share2G": {"size":2}}, "used_vols": {}, "size": 3}
+              {"voldict":  {"share2G": {"size":2}}, "used_vols": {"share2G": "fake_mgr"}, "size": None})
+    @ddt.unpack
+    def test_pop_gluster_vol_excp(self, voldict, used_vols, size):
+        self._driver.fetch_gluster_volumes = mock.Mock(return_value=voldict)
+        self._driver.gluster_used_vols_dict = used_vols
+        self._driver.setup_gluster_vol = mock.Mock()
 
         self.assertRaises(exception.GlusterfsException,
-                          self._driver._pop_gluster_vol)
+                          self._driver._pop_gluster_vol, size=size)
+        self.assertFalse(self._driver._setup_gluster_vol.called)
 
     def test_push_gluster_vol(self):
         gmgr = glusterfs.GlusterManager
@@ -403,13 +346,9 @@ class GlusterfsNativeShareDriverTestCase(test.TestCase):
 
         self._driver.gluster_used_vols_dict = {
             gmgr1.export: gmgr1, gmgr2.export: gmgr2}
-        self._driver.gluster_unused_vols_dict = {}
 
         self._driver._push_gluster_vol(gmgr2.export)
 
-        self.assertEqual(1, len(self._driver.gluster_unused_vols_dict))
-        self.assertTrue(
-            gmgr2.export in self._driver.gluster_unused_vols_dict)
         self.assertEqual(1, len(self._driver.gluster_used_vols_dict))
         self.assertFalse(
             gmgr2.export in self._driver.gluster_used_vols_dict)
@@ -708,32 +647,15 @@ class GlusterfsNativeShareDriverTestCase(test.TestCase):
         self.assertFalse(shutil.rmtree.called)
 
     def test_create_share(self):
-        gmgr = glusterfs.GlusterManager
-        gmgr1 = gmgr(self.gluster_target1, self._execute, None, None)
-        gmgr2 = gmgr(self.gluster_target2, self._execute, None, None)
-
-        self._driver.gluster_used_vols_dict = {gmgr1.export: gmgr1}
-        self._driver.gluster_unused_vols_dict = {gmgr2.export: gmgr2}
+        self._driver._pop_gluster_vol = mock.Mock(
+            return_value=self.gluster_target1)
 
         share = new_share()
 
         exp_locn = self._driver.create_share(self._context, share)
 
-        self.assertEqual(exp_locn, gmgr2.export)
-
-    def test_create_share_excp(self):
-        gmgr = glusterfs.GlusterManager
-        gmgr1 = gmgr(self.gluster_target1, self._execute, None, None)
-        gmgr2 = gmgr(self.gluster_target2, self._execute, None, None)
-
-        self._driver.gluster_used_vols_dict = {
-            gmgr2.export: gmgr2, gmgr1.export: gmgr1}
-        self._driver.gluster_unused_vols_dict = {}
-
-        share = new_share()
-
-        self.assertRaises(exception.GlusterfsException,
-                          self._driver.create_share, self._context, share)
+        self.assertEqual(exp_locn, self.gluster_target1)
+        self._driver._pop_gluster_vol.assert_called_once_with(share['size'])
 
     def test_delete_share(self):
         self._driver._wipe_gluster_vol = mock.Mock()
