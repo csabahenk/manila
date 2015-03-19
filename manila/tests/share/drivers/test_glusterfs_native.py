@@ -253,9 +253,8 @@ class GlusterfsNativeShareDriverTestCase(test.TestCase):
 
         self.assertRaises(exception.GlusterfsException,
                           self._driver._setup_gluster_vol, gmgr1.volume)
-        self.assertEqual(
-            [mock.call(*test_args[i]) for i in range(0, idx+1)],
-            gmgr1.gluster_call.call_args_list)
+        self.assertTrue(
+            mock.call(*test_args[idx]) in gmgr1.gluster_call.call_args_list)
         self.assertFalse(self._driver._restart_gluster_vol.called)
 
     def test_restart_gluster_vol(self):
