@@ -324,6 +324,8 @@ class GlusterfsNativeShareDriverTestCase(test.TestCase):
                            "host:/share": {"size": None}},
                "used_vols": {"host:/share2G": "fake_mgr"}, "size": None,
                "expected": "host:/share"},
+              {"voldict": {"host:/share": {}}, "used_vols": {}, "size": 1,
+               "expected": "host:/share"},
               {"voldict": {"host:/share": {}}, "used_vols": {}, "size": None,
                "expected": "host:/share"})
     @ddt.unpack
