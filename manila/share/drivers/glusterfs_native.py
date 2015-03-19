@@ -245,10 +245,11 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
     def _setup_gluster_vol(self, vol):
         # Enable gluster volumes for SSL access only.
 
+        gluster_mgr = self._glustermanager(vol)
+
         for option, value in six.iteritems(
             {NFS_EXPORT_VOL: 'off', CLIENT_SSL: 'on', SERVER_SSL: 'on'}
         ):
-            gluster_mgr = self._glustermanager(vol)
             try:
                 gluster_mgr.gluster_call(
                     'volume', 'set', gluster_mgr.volume,
@@ -262,9 +263,9 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
                 LOG.error(msg)
                 raise exception.GlusterfsException(msg)
 
-            # TODO(deepakcs) Remove this once ssl options can be
-            # set dynamically.
-            self._restart_gluster_vol(gluster_mgr)
+        # TODO(deepakcs) Remove this once ssl options can be
+        # set dynamically.
+        self._restart_gluster_vol(gluster_mgr)
 
     @staticmethod
     def _restart_gluster_vol(gluster_mgr):
@@ -333,7 +334,7 @@ class GlusterfsNativeShareDriver(driver.ExecuteMixin, driver.ShareDriver):
             sized_unused_vols.sort()
             vol = sized_unused_vols[0][1]
         elif unsized_unused_vols:
-            vol = unsized_unused_vols[0]
+            vol = unsized_unused_vols.pop()
         else:
             msg = (_("Couldn't find a free gluster volume to use."))
             LOG.error(msg)
